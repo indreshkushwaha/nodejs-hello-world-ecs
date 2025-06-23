@@ -1,0 +1,207 @@
+version: 0.2
+
+# Environment variables for the build
+env:
+  variables:
+    # Application configuration
+    NODE_ENV: "production"
+    APP_NAME: "nodejs-hello-world-ecs"
+    
+  parameter-store:
+    # Store sensitive values in AWS Systems Manager Parameter Store
+    AWS_ACCOUNT_ID: "/codebuild/aws-account-id"
+    ECR_REPOSITORY_NAME: "/codebuild/ecr-repository-name"
+    ECS_CLUSTER_NAME: "/codebuild/ecs-cluster-name"
+    ECS_SERVICE_NAME: "/codebuild/ecs-service-name"
+    ECS_TASK_DEFINITION_FAMILY: "/codebuild/ecs-task-definition-family"
+
+phases:
+  # Pre-build phase: Setup and authentication
+  pre_build:
+    commands:
+      - echo "=== PRE-BUILD PHASE STARTED ==="
+      - echo "Logging in to Amazon ECR..."
+      - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
+      - echo "Setting up environment variables..."
+      - REPOSITORY_URI=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$ECR_REPOSITORY_NAME
+      - COMMIT_HASH=$(echo $CODEBUILD_RESOLVED_SOURCE_VERSION | cut -c 1-7)
+      - IMAGE_TAG=${COMMIT_HASH:=latest}
+      - BUILD_TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+      - echo "Repository URI = $REPOSITORY_URI"
+      - echo "Image Tag = $IMAGE_TAG"
+      - echo "=== PRE-BUILD PHASE COMPLETED ==="
+
+  # Build phase: Docker image creation
+  build:
+    commands:
+      - echo "=== BUILD PHASE STARTED ==="
+      - echo "Build started on `date`"
+      - echo "Building the Docker image with tag $IMAGE_TAG..."
+      - docker build -f docker/Dockerfile -t $REPOSITORY_URI:latest .
+      - docker tag $REPOSITORY_URI:latest $REPOSITORY_URI:$IMAGE_TAG
+      - docker tag $REPOSITORY_URI:latest $REPOSITORY_URI:build-$BUILD_TIMESTAMP
+      - echo "=== BUILD PHASE COMPLETED ==="
+
+  # Post-build phase: Push image and update ECS
+  post_build:
+    commands:
+      - echo "=== POST-BUILD PHASE STARTED ==="
+      - echo "Build completed on `date`"
+      - echo "Pushing the Docker images to ECR..."
+      - docker push $REPOSITORY_URI:latest
+      - docker push $REPOSITORY_URI:$IMAGE_TAG
+      - docker push $REPOSITORY_URI:build-$BUILD_TIMESTAMP
+      - echo "Docker images pushed successfully"
+      - echo "Creating initial task definition and service if they don't exist..."
+      - |
+        # Check if task definition exists
+        if ! aws ecs describe-task-definition --task-definition $ECS_TASK_DEFINITION_FAMILY > /dev/null 2>&1; then
+          echo "Creating initial task definition..."
+          cat > initial-task-definition.json << EOF
+        {
+          "family": "$ECS_TASK_DEFINITION_FAMILY",
+          "executionRoleArn": "arn:aws:iam::$AWS_ACCOUNT_ID:role/ecsTaskExecutionRole",
+          "taskRoleArn": "arn:aws:iam::$AWS_ACCOUNT_ID:role/ecsTaskExecutionRole",
+          "networkMode": "awsvpc",
+          "requiresCompatibilities": ["FARGATE"],
+          "cpu": "256",
+          "memory": "512",
+          "containerDefinitions": [
+            {
+              "name": "$APP_NAME-container",
+              "image": "$REPOSITORY_URI:$IMAGE_TAG",
+              "portMappings": [
+                {
+                  "containerPort": 3000,
+                  "protocol": "tcp"
+                }
+              ],
+              "essential": true,
+              "environment": [
+                {
+                  "name": "NODE_ENV",
+                  "value": "production"
+                },
+                {
+                  "name": "APP_VERSION",
+                  "value": "$IMAGE_TAG"
+                },
+                {
+                  "name": "PORT",
+                  "value": "3000"
+                }
+              ],
+              "logConfiguration": {
+                "logDriver": "awslogs",
+                "options": {
+                  "awslogs-group": "/ecs/$APP_NAME",
+                  "awslogs-region": "$AWS_DEFAULT_REGION",
+                  "awslogs-stream-prefix": "ecs"
+                }
+              }
+            }
+          ]
+        }
+        EOF
+          aws ecs register-task-definition --cli-input-json file://initial-task-definition.json
+        fi
+      - |
+        # Check if service exists
+        if ! aws ecs describe-services --cluster $ECS_CLUSTER_NAME --services $ECS_SERVICE_NAME | grep -q "ACTIVE"; then
+          echo "Creating ECS service..."
+          # Get default VPC and subnets
+          VPC_ID=$(aws ec2 describe-vpcs --filters "Name=is-default,Values=true" --query "Vpcs[0].VpcId" --output text)
+          SUBNET_IDS=$(aws ec2 describe-subnets --filters "Name=vpc-id,Values=$VPC_ID" --query "Subnets[0:2].SubnetId" --output text | tr '\t' ',')
+          
+          # Create security group if it doesn't exist
+          SG_ID=$(aws ec2 describe-security-groups --filters "Name=group-name,Values=$APP_NAME-sg" --query "SecurityGroups[0].GroupId" --output text 2>/dev/null || echo "None")
+          
+          if [ "$SG_ID" = "None" ]; then
+            echo "Creating security group..."
+            SG_ID=$(aws ec2 create-security-group \
+              --group-name "$APP_NAME-sg" \
+              --description "Security group for $APP_NAME" \
+              --vpc-id $VPC_ID \
+              --query "GroupId" --output text)
+            
+            # Allow inbound traffic on port 3000
+            aws ec2 authorize-security-group-ingress \
+              --group-id $SG_ID \
+              --protocol tcp \
+              --port 3000 \
+              --cidr 0.0.0.0/0
+          fi
+          
+          aws ecs create-service \
+            --cluster $ECS_CLUSTER_NAME \
+            --service-name $ECS_SERVICE_NAME \
+            --task-definition $ECS_TASK_DEFINITION_FAMILY \
+            --desired-count 1 \
+            --launch-type FARGATE \
+            --network-configuration "awsvpcConfiguration={subnets=[$SUBNET_IDS],securityGroups=[$SG_ID],assignPublicIp=ENABLED}"
+        fi
+      - echo "Updating ECS task definition..."
+      - |
+        cat > task-definition-update.json << EOF
+        {
+          "family": "$ECS_TASK_DEFINITION_FAMILY",
+          "executionRoleArn": "arn:aws:iam::$AWS_ACCOUNT_ID:role/ecsTaskExecutionRole",
+          "taskRoleArn": "arn:aws:iam::$AWS_ACCOUNT_ID:role/ecsTaskExecutionRole",
+          "networkMode": "awsvpc",
+          "requiresCompatibilities": ["FARGATE"],
+          "cpu": "256",
+          "memory": "512",
+          "containerDefinitions": [
+            {
+              "name": "$APP_NAME-container",
+              "image": "$REPOSITORY_URI:$IMAGE_TAG",
+              "portMappings": [
+                {
+                  "containerPort": 3000,
+                  "protocol": "tcp"
+                }
+              ],
+              "essential": true,
+              "environment": [
+                {
+                  "name": "NODE_ENV",
+                  "value": "production"
+                },
+                {
+                  "name": "APP_VERSION",
+                  "value": "$IMAGE_TAG"
+                },
+                {
+                  "name": "PORT",
+                  "value": "3000"
+                }
+              ],
+              "logConfiguration": {
+                "logDriver": "awslogs",
+                "options": {
+                  "awslogs-group": "/ecs/$APP_NAME",
+                  "awslogs-region": "$AWS_DEFAULT_REGION",
+                  "awslogs-stream-prefix": "ecs"
+                }
+              }
+            }
+          ]
+        }
+        EOF
+      - echo "Registering new task definition..."
+      - aws ecs register-task-definition --cli-input-json file://task-definition-update.json
+      - echo "Updating ECS service..."
+      - aws ecs update-service --cluster $ECS_CLUSTER_NAME --service $ECS_SERVICE_NAME --task-definition $ECS_TASK_DEFINITION_FAMILY
+      - echo "=== POST-BUILD PHASE COMPLETED ==="
+
+# Artifacts to be uploaded to S3 (optional)
+artifacts:
+  files:
+    - task-definition-update.json
+  name: nodejs-hello-world-ecs-artifacts-$(date +%Y-%m-%d-%H-%M-%S)
+
+# Cache dependencies for faster builds
+cache:
+  paths:
+    - '/root/.npm/**/*'
+    - 'app/node_modules/**/*'
