@@ -1,7 +1,7 @@
 {
   "family": "nodejs-hello-world-ecs-task",
-  "executionRoleArn": "arn:aws:iam::605134441101:role/ecsTaskExecutionRole",
-  "taskRoleArn": "arn:aws:iam::605134441101:role/ecsTaskExecutionRole",
+  "executionRoleArn": "arn:aws:iam::842675987532:role/ecsTaskExecutionRole",
+  "taskRoleArn": "arn:aws:iam::842675987532:role/ecsTaskExecutionRole",
   "networkMode": "awsvpc",
   "requiresCompatibilities": ["FARGATE"],
   "cpu": "256",
@@ -9,7 +9,7 @@
   "containerDefinitions": [
     {
       "name": "nodejs-hello-world-ecs-container",
-      "image": "605134441101.dkr.ecr.us-east-1.amazonaws.com/nodejs-hello-world-ecs:latest",
+      "image": "842675987532.dkr.ecr.us-east-1.amazonaws.com/nodejs-hello-world-ecs:latest",
       "portMappings": [
         {
           "containerPort": 3000,
